@@ -13,13 +13,13 @@ EXPORT_DIR = os.environ.get("WEREAD_EXPORT_DIR", os.path.join(RUNTIME_DIR, "expo
 
 
 def download_one(url, fpath, retries=3):
-    if os.path.exists(fpath) and os.path.getsize(fpath) > 1000:
+    if os.path.exists(fpath) and os.path.getsize(fpath) > 32:
         return "skip"
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers=HEADERS)
             raw = urllib.request.urlopen(req, timeout=20).read()
-            if len(raw) > 500:
+            if len(raw) > 32:
                 open(fpath, "wb").write(raw)
                 return "ok"
         except Exception as e:

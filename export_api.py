@@ -9,12 +9,14 @@ import asyncio
 import base64
 import hashlib
 import html.entities
+import io
 import json
 import math
 import os
 import re
 import shutil
 import sys
+import tarfile
 import time
 from pathlib import Path
 from urllib.parse import quote
@@ -235,6 +237,42 @@ def normalize_xhtml_entities(xhtml):
     return re.sub(r"&([A-Za-z][A-Za-z0-9]+);", replace, xhtml)
 
 
+def dedupe_xhtml_attributes(xhtml):
+    attr_re = re.compile(
+        r"\s+([:\w.-]+)(\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s\"'=<>`]+))?"
+    )
+
+    def clean_tag(match):
+        tag = match.group(0)
+        if tag.startswith(("<!--", "<?", "<!")) or tag.startswith("</"):
+            return tag
+
+        close = "/>" if tag.endswith("/>") else ">"
+        inner = tag[1:-len(close)].strip()
+        if not inner:
+            return tag
+
+        name_match = re.match(r"([^\s/>]+)", inner)
+        if not name_match:
+            return tag
+
+        name = name_match.group(1)
+        rest = inner[name_match.end():]
+        seen = set()
+
+        def replace_attr(attr_match):
+            attr_name = attr_match.group(1)
+            key = attr_name.lower()
+            if key in seen:
+                return ""
+            seen.add(key)
+            return attr_match.group(0)
+
+        return "<" + name + attr_re.sub(replace_attr, rest) + close
+
+    return re.sub(r"<[^<>]+>", clean_tag, xhtml)
+
+
 def append_xhtml_blocks(xhtml, title, chapter_index, book_num_id, lines, images, image_seen):
     documents = split_xhtml_documents(xhtml)
     if not documents:
@@ -244,7 +282,7 @@ def append_xhtml_blocks(xhtml, title, chapter_index, book_num_id, lines, images,
             append_xhtml_blocks(document, title, chapter_index, book_num_id, lines, images, image_seen)
         return
 
-    xhtml = normalize_xhtml_entities(xhtml)
+    xhtml = dedupe_xhtml_attributes(normalize_xhtml_entities(xhtml))
     root = ET.fromstring(xhtml.encode("utf-8"))
     body = next((node for node in root.iter() if local_name(node.tag) == "body"), root)
 
@@ -305,6 +343,69 @@ def xhtml_to_markdown_parts(xhtml_parts, title, chapter_index, book_num_id):
 
 def xhtml_to_markdown(xhtml, title, chapter_index, book_num_id):
     return xhtml_to_markdown_parts([xhtml], title, chapter_index, book_num_id)
+
+
+def image_ext_from_bytes(data):
+    if data.startswith(b"\x89PNG"):
+        return "png"
+    if data.startswith(b"\xff\xd8"):
+        return "jpg"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "webp"
+    if data.startswith(b"GIF8"):
+        return "gif"
+    return "jpg"
+
+
+def tar_member_sort_key(member):
+    parts = [int(value) for value in re.findall(r"\d+", member.name)]
+    return parts or [0, member.name]
+
+
+async def tar_images_to_markdown(page, tar_url, title, chapter_index, book_dir):
+    response = await page.request.get(tar_url, timeout=30000)
+    body = await response.body()
+    if response.status != 200:
+        raise RuntimeError(f"{tar_url} status={response.status}: {body[:120]!r}")
+
+    images_dir = book_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    records = []
+    members_meta = []
+    lines = [f"# {title}", ""]
+    with tarfile.open(fileobj=io.BytesIO(body), mode="r:*") as tar:
+        members = []
+        for member in tar.getmembers():
+            if not member.isfile():
+                continue
+            extracted = tar.extractfile(member)
+            if not extracted:
+                continue
+            data = extracted.read()
+            ext = image_ext_from_bytes(data)
+            if ext == "jpg" and not data.startswith(b"\xff\xd8"):
+                continue
+            members.append((member, data, ext))
+
+        for seq, (member, data, ext) in enumerate(sorted(members, key=lambda item: tar_member_sort_key(item[0])), 1):
+            filename = f"ch{chapter_index:04d}_img{seq:02d}.{ext}"
+            (images_dir / filename).write_bytes(data)
+            records.append({
+                "url": f"{tar_url}#{member.name}",
+                "file": filename,
+                "source": "tar",
+            })
+            members_meta.append({
+                "name": member.name,
+                "size": member.size,
+                "file": filename,
+            })
+            lines.append(f"![图](images/{filename})")
+            lines.append("")
+
+    if not records:
+        raise RuntimeError(f"{tar_url} contained no supported images")
+    return "\n\n".join(line for line in lines if line.strip()) + "\n", records, members_meta, len(body)
 
 
 def chapter_uid_ranges(chapters, book_reader_id=None):
@@ -468,25 +569,43 @@ async def export_book(book_url_or_id, book_title=None, author=None):
         book_title = book_title or detected_title
         author = author or detected_author
 
-        chapters = [
-            ch for ch in await fetch_chapter_infos(page, book_num_id)
-            if ch.get("level") == 1 and ch.get("title") != "封面"
-        ]
+        chapter_infos = await fetch_chapter_infos(page, book_num_id)
+        has_nested_catalog = any((ch.get("level") or 0) > 1 for ch in chapter_infos)
+        if has_nested_catalog:
+            chapters = [
+                ch for ch in chapter_infos
+                if (ch.get("level") or 0) >= 1 and ch.get("title") != "封面"
+            ]
+        else:
+            chapters = [
+                ch for ch in chapter_infos
+                if ch.get("level") == 1 and ch.get("title") != "封面"
+            ]
+        (book_dir / "_catalog_full.json").write_text(
+            json.dumps(chapter_infos, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         (book_dir / "_catalog.json").write_text(
             json.dumps(chapters, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
         all_images = []
-        uid_ranges, xhtml_cache = await resolve_chapter_uid_ranges(
-            page, book_num_id, chapters, book_reader_id
-        )
+        if has_nested_catalog:
+            uid_ranges = [[int(chapter["chapterUid"])] for chapter in chapters]
+            xhtml_cache = {}
+        else:
+            uid_ranges, xhtml_cache = await resolve_chapter_uid_ranges(
+                page, book_num_id, chapters, book_reader_id
+            )
         catalog_uids = {int(chapter["chapterUid"]) for chapter in chapters}
         for idx, (chapter, uids) in enumerate(zip(chapters, uid_ranges), 1):
             title = chapter["title"]
             print(f"[{idx:02d}/{len(chapters):02d}] {title} ({uids[0]}-{uids[-1]})")
             xhtml_parts = []
             fetched_uids = []
+            tar_image_members = []
+            tar_body_bytes = 0
             for uid in uids:
                 try:
                     if uid in xhtml_cache:
@@ -496,10 +615,19 @@ async def export_book(book_url_or_id, book_title=None, author=None):
                     fetched_uids.append(uid)
                 except RuntimeError as exc:
                     label = "catalog" if int(uid) in catalog_uids else "implicit"
-                    print(f"  skip {label} chapterUid={uid}: {exc}")
-            if not xhtml_parts:
+                    if int(uid) == int(chapter["chapterUid"]) and chapter.get("tar"):
+                        print(f"  fallback {label} chapterUid={uid} to tar images: {exc}")
+                        md, images, tar_image_members, tar_body_bytes = await tar_images_to_markdown(
+                            page, chapter["tar"], title, idx, book_dir
+                        )
+                        fetched_uids.append(uid)
+                        break
+                    else:
+                        print(f"  skip {label} chapterUid={uid}: {exc}")
+            if not xhtml_parts and not tar_image_members:
                 raise RuntimeError(f"no XHTML fetched for chapterUid={chapter['chapterUid']} {title}")
-            md, images = xhtml_to_markdown_parts(xhtml_parts, title, idx, book_num_id)
+            if xhtml_parts:
+                md, images = xhtml_to_markdown_parts(xhtml_parts, title, idx, book_num_id)
             chapter_path = chapters_dir / f"{idx:04d}_{safe_name(title)}.md"
             chapter_path.write_text(md, encoding="utf-8")
             raw_payload = {
@@ -512,6 +640,10 @@ async def export_book(book_url_or_id, book_title=None, author=None):
                 "markdownChars": len(md),
                 "images": images,
             }
+            if tar_image_members:
+                raw_payload["tar"] = chapter.get("tar")
+                raw_payload["tarBodyBytes"] = tar_body_bytes
+                raw_payload["tarImages"] = tar_image_members
             (raw_dir / f"{idx:04d}_{safe_name(title)}.json").write_text(
                 json.dumps(raw_payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
