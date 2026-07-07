@@ -8,6 +8,7 @@ than from whichever visual page happened to be visible.
 import asyncio
 import base64
 import hashlib
+import html.entities
 import json
 import math
 import os
@@ -27,9 +28,21 @@ from export_precise import USER_DATA_DIR, prepare_user_data_dir
 RUNTIME_DIR = Path(os.environ.get("WEREAD_RUNTIME_DIR", ".runtime"))
 EXPORT_DIR = Path(os.environ.get("WEREAD_EXPORT_DIR", RUNTIME_DIR / "exports"))
 ARCHIVE_DIR = Path(os.environ.get("WEREAD_ARCHIVE_DIR", RUNTIME_DIR / "archives"))
+CHROME_EXECUTABLE = os.environ.get("WEREAD_CHROME_EXECUTABLE")
 
 INVALID = re.compile(r'[<>:"/\\|?*\n\r\t]+')
 SENTENCE_SPACE = re.compile(r"\s+")
+SPECIAL_CHAPTER_UID_RANGES = {
+    # WeRead's chapterInfos lists only part dividers for this book. The hidden
+    # chapter UIDs after 30 are not monotonic: 36 belongs to part 6, while
+    # 31-35 belong to part 7. UID 29 is an invalid placeholder.
+    "dd332b80813ab9b89g012936": {
+        27: [27, 28, 36],
+        30: [30, 31, 32, 33, 34, 35],
+    },
+}
+TAIL_SCAN_MAX_UIDS = int(os.environ.get("WEREAD_TAIL_SCAN_MAX_UIDS", "80"))
+TAIL_SCAN_INVALID_STREAK = int(os.environ.get("WEREAD_TAIL_SCAN_INVALID_STREAK", "6"))
 
 
 def safe_name(value, max_len=80):
@@ -195,12 +208,45 @@ def image_ext(url):
     return "jpg" if ext == "jpeg" else ext
 
 
-def xhtml_to_markdown(xhtml, title, chapter_index, book_num_id):
+def split_xhtml_documents(xhtml):
+    parts = [
+        part for part in re.split(r"(?=<\?xml\b)", xhtml)
+        if part.strip() and "<html" in part and "</html>" in part
+    ]
+    if parts:
+        return parts
+    if xhtml.strip() and "<html" in xhtml and "</html>" in xhtml:
+        return [xhtml]
+    return []
+
+
+def normalize_xhtml_entities(xhtml):
+    xml_entities = {"amp", "lt", "gt", "quot", "apos"}
+
+    def replace(match):
+        name = match.group(1)
+        if name in xml_entities:
+            return match.group(0)
+        value = html.entities.html5.get(name + ";")
+        if value is None:
+            return match.group(0)
+        return value
+
+    return re.sub(r"&([A-Za-z][A-Za-z0-9]+);", replace, xhtml)
+
+
+def append_xhtml_blocks(xhtml, title, chapter_index, book_num_id, lines, images, image_seen):
+    documents = split_xhtml_documents(xhtml)
+    if not documents:
+        return
+    if len(documents) > 1:
+        for document in documents:
+            append_xhtml_blocks(document, title, chapter_index, book_num_id, lines, images, image_seen)
+        return
+
+    xhtml = normalize_xhtml_entities(xhtml)
     root = ET.fromstring(xhtml.encode("utf-8"))
     body = next((node for node in root.iter() if local_name(node.tag) == "body"), root)
-    lines = [f"# {title}", ""]
-    images = []
-    image_seen = {}
 
     def emit_image(node):
         if is_footnote_image(node):
@@ -222,6 +268,9 @@ def xhtml_to_markdown(xhtml, title, chapter_index, book_num_id):
             emit_image(node)
             return
         if tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+            for child in node.iter():
+                if child is not node and local_name(child.tag) == "img":
+                    emit_image(child)
             heading = normalize_text(node.attrib.get("title")) or inline_text(node)
             if heading and heading != title:
                 level = min(max(int(tag[1]), 2), 6)
@@ -229,6 +278,9 @@ def xhtml_to_markdown(xhtml, title, chapter_index, book_num_id):
                 lines.append("")
             return
         if tag == "p":
+            for child in node.iter():
+                if child is not node and local_name(child.tag) == "img":
+                    emit_image(child)
             text = inline_text(node)
             if text:
                 lines.append(text)
@@ -240,9 +292,39 @@ def xhtml_to_markdown(xhtml, title, chapter_index, book_num_id):
     for child in body:
         walk(child)
 
-    while lines and lines[-1] == "":
-        lines.pop()
-    return "\n\n".join(lines) + "\n", images
+
+def xhtml_to_markdown_parts(xhtml_parts, title, chapter_index, book_num_id):
+    lines = [f"# {title}", ""]
+    images = []
+    image_seen = {}
+    for xhtml in xhtml_parts:
+        append_xhtml_blocks(xhtml, title, chapter_index, book_num_id, lines, images, image_seen)
+    blocks = [line for line in lines if line.strip()]
+    return "\n\n".join(blocks) + "\n", images
+
+
+def xhtml_to_markdown(xhtml, title, chapter_index, book_num_id):
+    return xhtml_to_markdown_parts([xhtml], title, chapter_index, book_num_id)
+
+
+def chapter_uid_ranges(chapters, book_reader_id=None):
+    special = SPECIAL_CHAPTER_UID_RANGES.get(book_reader_id or "")
+    chapter_uids = [int(chapter["chapterUid"]) for chapter in chapters]
+    if special:
+        return [special.get(uid, [uid]) for uid in chapter_uids]
+
+    if chapter_uids != sorted(chapter_uids):
+        return [[uid] for uid in chapter_uids]
+
+    ranges = []
+    for idx, chapter in enumerate(chapters):
+        start = chapter_uids[idx]
+        if idx + 1 < len(chapters):
+            stop = chapter_uids[idx + 1]
+        else:
+            stop = start + 1
+        ranges.append(list(range(start, stop)))
+    return ranges
 
 
 async def request_text(page, url, payload):
@@ -268,10 +350,38 @@ async def fetch_chapter_xhtml(page, book_num_id, chapter_uid):
             payload,
         )
         pieces.append(strip_response_hash(raw))
-    xhtml = decode_segment_string("".join(pieces))
+    try:
+        xhtml = decode_segment_string("".join(pieces))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise RuntimeError(f"chapterUid={chapter_uid} did not decode cleanly: {exc}") from exc
     if "<html" not in xhtml or "</html>" not in xhtml:
         raise RuntimeError(f"chapterUid={chapter_uid} did not decode to XHTML")
     return xhtml
+
+
+async def resolve_chapter_uid_ranges(page, book_num_id, chapters, book_reader_id=None):
+    ranges = chapter_uid_ranges(chapters, book_reader_id)
+    if not ranges or SPECIAL_CHAPTER_UID_RANGES.get(book_reader_id or ""):
+        return ranges, {}
+
+    cache = {}
+    last_range = list(ranges[-1])
+    seen = set(last_range)
+    invalid_streak = 0
+    next_uid = max(last_range) + 1
+    upper = next_uid + TAIL_SCAN_MAX_UIDS
+    while next_uid < upper and invalid_streak < TAIL_SCAN_INVALID_STREAK:
+        try:
+            cache[next_uid] = await fetch_chapter_xhtml(page, book_num_id, next_uid)
+            if next_uid not in seen:
+                last_range.append(next_uid)
+                seen.add(next_uid)
+            invalid_streak = 0
+        except RuntimeError:
+            invalid_streak += 1
+        next_uid += 1
+    ranges[-1] = last_range
+    return ranges, cache
 
 
 async def fetch_chapter_infos(page, book_num_id):
@@ -289,6 +399,8 @@ async def fetch_chapter_infos(page, book_num_id):
 
 
 async def download_images(page, book_dir, image_records):
+    if os.environ.get("WEREAD_SKIP_INLINE_IMAGE_DOWNLOAD", "").lower() in {"1", "true", "yes", "on"}:
+        return 0, 0
     images_dir = book_dir / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
     ok = fail = 0
@@ -328,10 +440,15 @@ async def export_book(book_url_or_id, book_title=None, author=None):
 
     async with async_playwright() as p:
         headless = os.environ.get("WEREAD_HEADLESS", "1").lower() not in {"0", "false", "no", "off"}
+        launch_options = {
+            "headless": headless,
+            "viewport": {"width": 1400, "height": 1000},
+        }
+        if CHROME_EXECUTABLE:
+            launch_options["executable_path"] = CHROME_EXECUTABLE
         ctx = await p.chromium.launch_persistent_context(
             USER_DATA_DIR,
-            headless=headless,
-            viewport={"width": 1400, "height": 1000},
+            **launch_options,
         )
         page = await ctx.new_page()
         await page.goto(f"https://weread.qq.com/web/reader/{book_reader_id}", wait_until="networkidle", timeout=45000)
@@ -361,20 +478,37 @@ async def export_book(book_url_or_id, book_title=None, author=None):
         )
 
         all_images = []
-        for idx, chapter in enumerate(chapters, 1):
+        uid_ranges, xhtml_cache = await resolve_chapter_uid_ranges(
+            page, book_num_id, chapters, book_reader_id
+        )
+        catalog_uids = {int(chapter["chapterUid"]) for chapter in chapters}
+        for idx, (chapter, uids) in enumerate(zip(chapters, uid_ranges), 1):
             title = chapter["title"]
-            uid = chapter["chapterUid"]
-            print(f"[{idx:02d}/{len(chapters):02d}] {title}")
-            xhtml = await fetch_chapter_xhtml(page, book_num_id, uid)
-            md, images = xhtml_to_markdown(xhtml, title, idx, book_num_id)
+            print(f"[{idx:02d}/{len(chapters):02d}] {title} ({uids[0]}-{uids[-1]})")
+            xhtml_parts = []
+            fetched_uids = []
+            for uid in uids:
+                try:
+                    if uid in xhtml_cache:
+                        xhtml_parts.append(xhtml_cache[uid])
+                    else:
+                        xhtml_parts.append(await fetch_chapter_xhtml(page, book_num_id, uid))
+                    fetched_uids.append(uid)
+                except RuntimeError as exc:
+                    label = "catalog" if int(uid) in catalog_uids else "implicit"
+                    print(f"  skip {label} chapterUid={uid}: {exc}")
+            if not xhtml_parts:
+                raise RuntimeError(f"no XHTML fetched for chapterUid={chapter['chapterUid']} {title}")
+            md, images = xhtml_to_markdown_parts(xhtml_parts, title, idx, book_num_id)
             chapter_path = chapters_dir / f"{idx:04d}_{safe_name(title)}.md"
             chapter_path.write_text(md, encoding="utf-8")
             raw_payload = {
-                "chapterUid": uid,
+                "chapterUid": chapter["chapterUid"],
+                "sectionUids": fetched_uids,
                 "chapterIdx": chapter.get("chapterIdx"),
                 "title": title,
                 "wordCount": chapter.get("wordCount"),
-                "xhtmlChars": len(xhtml),
+                "xhtmlChars": sum(len(part) for part in xhtml_parts),
                 "markdownChars": len(md),
                 "images": images,
             }
@@ -382,7 +516,10 @@ async def export_book(book_url_or_id, book_title=None, author=None):
                 json.dumps(raw_payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            (raw_dir / f"{idx:04d}_{safe_name(title)}.xhtml").write_text(xhtml, encoding="utf-8")
+            (raw_dir / f"{idx:04d}_{safe_name(title)}.xhtml").write_text(
+                "\n\n".join(xhtml_parts),
+                encoding="utf-8",
+            )
             all_images.extend(images)
 
         ok, fail = await download_images(page, book_dir, all_images)

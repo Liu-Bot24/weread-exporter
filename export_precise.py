@@ -25,6 +25,7 @@ LEGACY_USER_DATA_DIR = os.path.join("cache", "browser_profile")
 USER_DATA_DIR = os.environ.get("WEREAD_USER_DATA_DIR", DEFAULT_USER_DATA_DIR)
 LAYOUT_MODE = os.environ.get("WEREAD_LAYOUT_MODE", "single").strip().lower()
 SINGLE_PAGE_MODE = LAYOUT_MODE != "spread"
+CHROME_EXECUTABLE = os.environ.get("WEREAD_CHROME_EXECUTABLE")
 
 CANVAS_HOOK = """
 (function() {
@@ -389,9 +390,15 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         }
         print(f"  版式模式: {'单页质量模式' if SINGLE_PAGE_MODE else '双页/宽屏模式'} "
               f"({viewport['width']}x{viewport['height']})")
+        launch_options = {
+            "headless": headless,
+            "viewport": viewport,
+            "args": ["--disable-blink-features=AutomationControlled"],
+        }
+        if CHROME_EXECUTABLE:
+            launch_options["executable_path"] = CHROME_EXECUTABLE
         ctx = await p.chromium.launch_persistent_context(
-            USER_DATA_DIR, headless=headless, viewport=viewport,
-            args=["--disable-blink-features=AutomationControlled"])
+            USER_DATA_DIR, **launch_options)
 
         login_page = await ctx.new_page()
         await login_page.goto("https://weread.qq.com/web/shelf", timeout=30000)

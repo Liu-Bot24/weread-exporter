@@ -28,6 +28,8 @@ from export_precise import (
 )
 
 
+CHROME_EXECUTABLE = os.environ.get("WEREAD_CHROME_EXECUTABLE")
+
 CATALOG_IMAGES_JS = """
 () => Array.from(document.querySelectorAll('img[class*="wr_readerImage"], img[src*="res.weread.qq.com/wrepub"]'))
     .map(i => {
@@ -277,11 +279,16 @@ async def run(book_id):
         "height": int(os.environ.get("WEREAD_VIEWPORT_HEIGHT", "900")),
     }
     async with async_playwright() as p:
+        launch_options = {
+            "headless": headless,
+            "viewport": viewport,
+            "args": ["--disable-blink-features=AutomationControlled"],
+        }
+        if CHROME_EXECUTABLE:
+            launch_options["executable_path"] = CHROME_EXECUTABLE
         ctx = await p.chromium.launch_persistent_context(
             USER_DATA_DIR or DEFAULT_USER_DATA_DIR,
-            headless=headless,
-            viewport=viewport,
-            args=["--disable-blink-features=AutomationControlled"],
+            **launch_options,
         )
         login_page = await ctx.new_page()
         await login_page.goto("https://weread.qq.com/web/shelf", timeout=30000)
