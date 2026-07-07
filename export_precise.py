@@ -11,26 +11,58 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import urllib.request
 
 from playwright.async_api import async_playwright
 
-USER_DATA_DIR = os.path.join("cache", "browser_profile")
+RUNTIME_DIR = os.environ.get("WEREAD_RUNTIME_DIR", ".runtime")
+CACHE_DIR = os.environ.get("WEREAD_CACHE_DIR", os.path.join(RUNTIME_DIR, "cache"))
+EXPORT_DIR = os.environ.get("WEREAD_EXPORT_DIR", os.path.join(RUNTIME_DIR, "exports"))
+DEFAULT_USER_DATA_DIR = os.path.join(CACHE_DIR, "browser_profile")
+LEGACY_USER_DATA_DIR = os.path.join("cache", "browser_profile")
+USER_DATA_DIR = os.environ.get("WEREAD_USER_DATA_DIR", DEFAULT_USER_DATA_DIR)
+LAYOUT_MODE = os.environ.get("WEREAD_LAYOUT_MODE", "single").strip().lower()
+SINGLE_PAGE_MODE = LAYOUT_MODE != "spread"
 
 CANVAS_HOOK = """
 (function() {
     window.__wr_chars = [];
     var origFill = CanvasRenderingContext2D.prototype.fillText;
     CanvasRenderingContext2D.prototype.fillText = function(text, x, y) {
-        if (text && text.trim())
-            window.__wr_chars.push({t: text, x: Math.round(x*10)/10, y: Math.round(y*10)/10});
+        if (text && text.trim()) {
+            var r = this.canvas ? this.canvas.getBoundingClientRect() : null;
+            window.__wr_chars.push({
+                t: text,
+                x: Math.round(x*10)/10,
+                y: Math.round(y*10)/10,
+                canvasLeft: r ? Math.round(r.left) : 0,
+                canvasTop: r ? Math.round(r.top) : 0,
+                canvasWidth: r ? Math.round(r.width) : 0,
+                canvasHeight: r ? Math.round(r.height) : 0
+            });
+        }
         return origFill.apply(this, arguments);
     };
     window.__wr_reset = function() { window.__wr_chars = []; };
     window.__wr_count = function() { return window.__wr_chars.length; };
 })();
 """
+
+
+def prepare_user_data_dir():
+    if (USER_DATA_DIR == DEFAULT_USER_DATA_DIR and
+            not os.path.exists(USER_DATA_DIR) and
+            os.path.isdir(LEGACY_USER_DATA_DIR)):
+        os.makedirs(os.path.dirname(USER_DATA_DIR), exist_ok=True)
+        shutil.move(LEGACY_USER_DATA_DIR, USER_DATA_DIR)
+        try:
+            os.rmdir(os.path.dirname(LEGACY_USER_DATA_DIR))
+        except OSError:
+            pass
+        print(f"  ℹ️  已迁移浏览器缓存: {LEGACY_USER_DATA_DIR} -> {USER_DATA_DIR}")
+    os.makedirs(USER_DATA_DIR, exist_ok=True)
 
 # 当前视口内可见的书籍插图，带屏幕坐标
 VIEWPORT_IMGS_JS = """
@@ -66,11 +98,58 @@ SENTENCE_END = set("。！？；：」）】》…—")
 
 def split_spread(chars):
     """双页拆分：返回 [左页chars, 右页chars] 或 [单页chars]"""
-    if len(chars) < 20:
+    if len(chars) < 10:
         return [chars]
     singles = [(i, c) for i, c in enumerate(chars) if len(c["t"]) == 1]
     if len(singles) < 10:
         return [chars]
+
+    # Newer captures include the rendering canvas geometry. If WeRead renders
+    # a spread through two canvases, split by canvas instead of draw order.
+    canvas_groups = {}
+    for _, c in singles:
+        width = c.get("canvasWidth", 0)
+        height = c.get("canvasHeight", 0)
+        if width > 100 and height > 300:
+            key = (round(c.get("canvasLeft", 0) / 20) * 20,
+                   round(c.get("canvasTop", 0) / 20) * 20,
+                   round(width / 20) * 20,
+                   round(height / 20) * 20)
+            canvas_groups[key] = canvas_groups.get(key, 0) + 1
+    prominent = [key for key, count in canvas_groups.items() if count >= 5]
+    if len(prominent) >= 2:
+        selected = sorted(prominent, key=lambda k: k[0])[:2]
+
+        def char_canvas_key(c):
+            return (round(c.get("canvasLeft", 0) / 20) * 20,
+                    round(c.get("canvasTop", 0) / 20) * 20,
+                    round(c.get("canvasWidth", 0) / 20) * 20,
+                    round(c.get("canvasHeight", 0) / 20) * 20)
+
+        pages = [[c for c in chars if char_canvas_key(c) == key] for key in selected]
+        if all(len(page) >= 5 for page in pages):
+            return pages
+
+    # Some spreads render into one wide canvas and the fillText calls may be
+    # interleaved row-by-row. Split by the largest horizontal gap so left and
+    # right pages do not get merged into one line.
+    xs = sorted(c["x"] for _, c in singles if isinstance(c.get("x"), (int, float)))
+    if len(xs) >= 20:
+        best_gap = 0
+        split_x = None
+        for left, right in zip(xs, xs[1:]):
+            gap = right - left
+            if gap > best_gap:
+                best_gap = gap
+                split_x = (left + right) / 2
+        if split_x is not None and best_gap >= max(100, (xs[-1] - xs[0]) * 0.18):
+            left_count = sum(1 for _, c in singles if c["x"] < split_x)
+            right_count = len(singles) - left_count
+            if left_count >= 10 and right_count >= 10:
+                left_page = [c for c in chars if c.get("x", 0) < split_x]
+                right_page = [c for c in chars if c.get("x", 0) >= split_x]
+                return [left_page, right_page]
+
     for j in range(1, len(singles)):
         if singles[j - 1][1]["y"] > 400 and singles[j][1]["y"] < 200:
             return [chars[:singles[j][0]], chars[singles[j][0]:]]
@@ -104,7 +183,12 @@ def build_page_blocks(chars, images, canvas_rects, seen_imgs):
     rects = sorted(canvas_rects, key=lambda r: r["left"])
     left_rect = rects[0] if rects else {"top": 0, "left": 0}
     right_rect = rects[1] if len(rects) > 1 else left_rect
-    mid_x = (left_rect["left"] + right_rect["left"]) / 2 + 180 if len(rects) > 1 else 99999
+    if len(rects) > 1:
+        mid_x = (left_rect["left"] + left_rect["w"] + right_rect["left"]) / 2
+    elif len(pages) == 2 and rects:
+        mid_x = left_rect["left"] + left_rect["w"] / 2
+    else:
+        mid_x = 99999
 
     # 图片按左右分组
     left_imgs = [im for im in images if im["left"] < mid_x]
@@ -220,7 +304,11 @@ def load_last_catalog_title(catalog_path):
 
 async def _title(page):
     return await page.evaluate(
-        "() => document.querySelector('.renderTargetPageInfo_header_chapterTitle')?.textContent?.trim() || ''")
+        """() => (
+            document.querySelector('.renderTargetPageInfo_header_chapterTitle')?.textContent?.trim()
+            || document.querySelector('.readerTopBar_title_chapter')?.textContent?.trim()
+            || ''
+        ).replace(/当前读到.*$/, '').trim()""")
 
 
 async def fetch_book_title(page):
@@ -237,24 +325,35 @@ async def fetch_book_title(page):
 async def goto_first_chapter(page, catalog_path=None):
     first_title = ""
     try:
-        await page.click("button.readerControls_item.catalog", timeout=5000)
+        await page.locator("button.rbb_item.catalog, button.readerControls_item.catalog").first.click(
+            timeout=5000, force=True)
         await asyncio.sleep(1.5)
         titles = await page.evaluate("""() => Array.from(
-            document.querySelectorAll('.readerCatalog_list_item')).map(el => el.textContent.trim())""")
+            document.querySelectorAll('.readerCatalog_list_item'))
+            .map(el => el.textContent.replace(/当前读到.*$/, '').trim())
+            .filter(Boolean)""")
         if titles and catalog_path:
             with open(catalog_path, "w") as f:
                 json.dump(titles, f, ensure_ascii=False)
         await page.evaluate("""() => {
             const sc = document.querySelector('.readerCatalog_list_scroll_area, [class*="readerCatalog_list_scroll"]');
-            if (sc) sc.scrollTop = 0;
+            if (sc) {
+                sc.scrollTop = 0;
+                sc.dispatchEvent(new Event("scroll", {bubbles: true}));
+            }
         }""")
         await asyncio.sleep(1)
-        item = page.locator(".readerCatalog_list_item").first
-        first_title = (await item.text_content() or "").strip()
-        await item.click(timeout=4000)
+        first_title = await page.evaluate("""() => {
+            const item = document.querySelector('.readerCatalog_list_item');
+            if (!item) return '';
+            const title = item.textContent.replace(/当前读到.*$/, '').trim();
+            item.click();
+            return title;
+        }""")
         await asyncio.sleep(3)
         try:
-            await page.click("button.readerControls_item.catalog", timeout=2000)
+            await page.locator("button.rbb_item.catalog, button.readerControls_item.catalog").first.click(
+                timeout=2000, force=True)
         except Exception:
             await page.keyboard.press("Escape")
         await asyncio.sleep(2)
@@ -281,8 +380,17 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
     reached_end = False
     last_cat_title = load_last_catalog_title(catalog_path) if catalog_path else ""
     async with async_playwright() as p:
+        headless = os.environ.get("WEREAD_HEADLESS", "").lower() in {"1", "true", "yes", "on"}
+        default_width = "760" if SINGLE_PAGE_MODE else "1200"
+        default_height = "1100" if SINGLE_PAGE_MODE else "900"
+        viewport = {
+            "width": int(os.environ.get("WEREAD_VIEWPORT_WIDTH", default_width)),
+            "height": int(os.environ.get("WEREAD_VIEWPORT_HEIGHT", default_height)),
+        }
+        print(f"  版式模式: {'单页质量模式' if SINGLE_PAGE_MODE else '双页/宽屏模式'} "
+              f"({viewport['width']}x{viewport['height']})")
         ctx = await p.chromium.launch_persistent_context(
-            USER_DATA_DIR, headless=False, viewport={"width": 1200, "height": 900},
+            USER_DATA_DIR, headless=headless, viewport=viewport,
             args=["--disable-blink-features=AutomationControlled"])
 
         login_page = await ctx.new_page()
@@ -317,6 +425,8 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         await asyncio.sleep(0.5)
 
         current_chapter = await _title(page)
+        if not current_chapter:
+            raise RuntimeError("无法识别当前章节标题，停止导出以避免生成无边界文档。")
         print(f"  📖 {book_title} — {book_author}")
         print(f"  会话开始:「{current_chapter}」\n")
 
@@ -333,6 +443,10 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             chars = await page.evaluate("() => window.__wr_chars")
             rects = await page.evaluate(CANVAS_RECTS_JS)
             imgs = await page.evaluate(VIEWPORT_IMGS_JS)
+            if SINGLE_PAGE_MODE and len(split_spread(chars)) > 1:
+                raise RuntimeError(
+                    "单页质量模式下仍检测到双页内容。请调小 WEREAD_VIEWPORT_WIDTH，"
+                    "或显式设置 WEREAD_LAYOUT_MODE=spread 后自行承担跨章双页风险。")
             before = len(ch_blocks)
             new_blocks = build_page_blocks(chars, imgs, rects, seen_imgs)
             # 文字去重：同一页可能重复捕获，按文本行内容去重
@@ -436,8 +550,8 @@ async def main(book_id):
     print("=" * 60)
     print("  weread-exporter — 精确图文导出 v3")
     print("=" * 60)
-    os.makedirs(USER_DATA_DIR, exist_ok=True)
-    book_dir = os.path.join("output", book_id)
+    prepare_user_data_dir()
+    book_dir = os.path.join(EXPORT_DIR, book_id)
     md_dir = os.path.join(book_dir, "chapters")
     raw_dir = os.path.join(book_dir, "raw")
     img_dir = os.path.join(book_dir, "images")
@@ -478,7 +592,9 @@ async def main(book_id):
     img_count = len([f for f in os.listdir(img_dir) if not f.startswith(".")])
     if not book_title: book_title = book_id
     safe = re.sub(r'[<>:"/\\|?*]', '_', book_title)
-    merged = os.path.join("output", f"{safe}.md")
+    merged_dir = os.path.join(EXPORT_DIR, "merged")
+    os.makedirs(merged_dir, exist_ok=True)
+    merged = os.path.join(merged_dir, f"{safe}.md")
     with open(merged, "w") as out:
         out.write(f"# {book_title}\n\n**{book_author}**\n\n---\n\n")
         for fn in total_files:

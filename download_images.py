@@ -8,6 +8,8 @@ _orig = socket.getaddrinfo
 socket.getaddrinfo = lambda *a, **k: [x for x in _orig(*a, **k) if x[0] == socket.AF_INET]
 
 HEADERS = {"Referer": "https://weread.qq.com/", "User-Agent": "Mozilla/5.0"}
+RUNTIME_DIR = os.environ.get("WEREAD_RUNTIME_DIR", ".runtime")
+EXPORT_DIR = os.environ.get("WEREAD_EXPORT_DIR", os.path.join(RUNTIME_DIR, "exports"))
 
 
 def download_one(url, fpath, retries=3):
@@ -28,7 +30,11 @@ def download_one(url, fpath, retries=3):
 
 
 def main(book_id):
-    book_dir = os.path.join("output", book_id)
+    book_dir = os.path.join(EXPORT_DIR, book_id)
+    if not os.path.isdir(os.path.join(book_dir, "raw")):
+        legacy_dir = os.path.join("output", book_id)
+        if os.path.isdir(os.path.join(legacy_dir, "raw")):
+            book_dir = legacy_dir
     raw_dir = os.path.join(book_dir, "raw")
     img_dir = os.path.join(book_dir, "images")
     os.makedirs(img_dir, exist_ok=True)
