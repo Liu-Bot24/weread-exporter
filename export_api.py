@@ -8,6 +8,7 @@ than from whichever visual page happened to be visible.
 import asyncio
 import base64
 import hashlib
+import html
 import html.entities
 import io
 import json
@@ -441,6 +442,27 @@ async def request_text(page, url, payload):
     return text
 
 
+def plaintext_chapter_to_xhtml(content):
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in re.split(r"(?:\r?\n\s*)+", content or "")
+        if paragraph.strip()
+    ]
+    body = "".join(f"<p>{html.escape(paragraph)}</p>" for paragraph in paragraphs)
+    return f"<?xml version=\"1.0\" encoding=\"utf-8\"?><html><body>{body}</body></html>"
+
+
+def json_chapter_to_xhtml(raw):
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    content = data.get("content") if isinstance(data, dict) else None
+    if not content:
+        return None
+    return plaintext_chapter_to_xhtml(content)
+
+
 async def fetch_chapter_xhtml(page, book_num_id, chapter_uid):
     pieces = []
     for part_idx in (0, 1, 3):
@@ -450,7 +472,11 @@ async def fetch_chapter_xhtml(page, book_num_id, chapter_uid):
             f"https://weread.qq.com/web/book/chapter/e_{part_idx}",
             payload,
         )
-        pieces.append(strip_response_hash(raw))
+        body = strip_response_hash(raw)
+        plaintext_xhtml = json_chapter_to_xhtml(body)
+        if plaintext_xhtml:
+            return plaintext_xhtml
+        pieces.append(body)
     try:
         xhtml = decode_segment_string("".join(pieces))
     except (ValueError, UnicodeDecodeError) as exc:
@@ -571,10 +597,16 @@ async def export_book(book_url_or_id, book_title=None, author=None):
 
         chapter_infos = await fetch_chapter_infos(page, book_num_id)
         has_nested_catalog = any((ch.get("level") or 0) > 1 for ch in chapter_infos)
+        has_level_catalog = any("level" in ch for ch in chapter_infos)
         if has_nested_catalog:
             chapters = [
                 ch for ch in chapter_infos
                 if (ch.get("level") or 0) >= 1 and ch.get("title") != "封面"
+            ]
+        elif not has_level_catalog:
+            chapters = [
+                ch for ch in chapter_infos
+                if ch.get("title") != "封面"
             ]
         else:
             chapters = [
